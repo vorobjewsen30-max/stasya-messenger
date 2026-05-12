@@ -7,7 +7,7 @@ const path = require('path');
 const fs = require('fs');
 const { Server } = require('socket.io');
 const rateLimit = require('express-rate-limit');
-const { db, DATA_PATH, DB_PATH } = require('./database');
+const { initDatabase, DATA_PATH, DB_PATH } = require('./database');
 
 const app = express();
 const server = http.createServer(app);
@@ -43,39 +43,52 @@ const io = new Server(server, {
 app.set('io', io);
 app.set('dataPath', DATA_PATH);
 
-require('./ws/socketHandler')(io, DATA_PATH);
+// Инициализация и запуск
+async function start() {
+  // Инициализируем БД
+  await initDatabase();
+  console.log('✅ SQLite готова');
 
-// API маршруты
-const { router: authRouter } = require('./routes/auth');
-app.use('/api/auth', authRouter);
-app.use('/api/users', require('./routes/users'));
-app.use('/api/channels', require('./routes/channels'));
-app.use('/api/messages', require('./routes/messages'));
-app.use('/api/bots', require('./routes/bots'));
-app.use('/api/calls', require('./routes/calls'));
-app.use('/api/upload', require('./routes/upload'));
+  // Подключаем WebSocket
+  require('./ws/socketHandler')(io, DATA_PATH);
 
-// Клиент в production
-if (process.env.NODE_ENV === 'production') {
-  app.use(express.static(path.join(__dirname, '..', 'client', 'build')));
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '..', 'client', 'build', 'index.html'));
+  // API маршруты
+  const { router: authRouter } = require('./routes/auth');
+  app.use('/api/auth', authRouter);
+  app.use('/api/users', require('./routes/users'));
+  app.use('/api/channels', require('./routes/channels'));
+  app.use('/api/messages', require('./routes/messages'));
+  app.use('/api/bots', require('./routes/bots'));
+  app.use('/api/calls', require('./routes/calls'));
+  app.use('/api/upload', require('./routes/upload'));
+
+  // Клиент в production
+  if (process.env.NODE_ENV === 'production') {
+    app.use(express.static(path.join(__dirname, '..', 'client', 'build')));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(__dirname, '..', 'client', 'build', 'index.html'));
+    });
+  }
+
+  // Запуск
+  const PORT = process.env.PORT || 3000;
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Stasya Messenger запущен на порту ${PORT}`);
+    console.log(`📁 Данные: ${DATA_PATH}`);
+    console.log(`🗄️ База данных: ${DB_PATH}`);
   });
 }
 
-// Запуск
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Stasya Messenger запущен на порту ${PORT}`);
-  console.log(`📁 Данные: ${DATA_PATH}`);
-  console.log(`🗄️ База данных: ${DB_PATH}`);
-  console.log(`✅ SQLite готов, Render Disk не требуется отдельно!`);
+start().catch(err => {
+  console.error('Ошибка запуска:', err);
+  process.exit(1);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('Завершение...');
-  db.close();
+  const { saveDatabase } = require('./database');
+  saveDatabase();
   server.close(() => process.exit(0));
 });
 
