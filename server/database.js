@@ -2,6 +2,7 @@ const initSqlJs = require('sql.js');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 
 // Путь к БД на Render Disk
 const DATA_PATH = process.env.RENDER_DISK_PATH || path.join(__dirname, '..', 'data');
@@ -17,7 +18,6 @@ let db = null;
 async function initDatabase() {
   const SQL = await initSqlJs();
   
-  // Загружаем существующую БД или создаём новую
   if (fs.existsSync(DB_PATH)) {
     const fileBuffer = fs.readFileSync(DB_PATH);
     db = new SQL.Database(fileBuffer);
@@ -27,23 +27,15 @@ async function initDatabase() {
     console.log('🆕 Создана новая база данных');
   }
 
-  // Создаём таблицы
+  // Таблицы
   db.run(`
     CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      username TEXT UNIQUE NOT NULL,
-      email TEXT UNIQUE NOT NULL,
-      password TEXT NOT NULL,
-      display_name TEXT DEFAULT '',
-      avatar TEXT DEFAULT '',
-      status TEXT DEFAULT 'offline',
-      custom_status TEXT DEFAULT '',
-      bio TEXT DEFAULT '',
-      is_bot INTEGER DEFAULT 0,
-      bot_token TEXT UNIQUE,
-      bot_owner TEXT,
-      last_seen TEXT DEFAULT (datetime('now')),
-      created_at TEXT DEFAULT (datetime('now'))
+      id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, email TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL, display_name TEXT DEFAULT '', avatar TEXT DEFAULT '',
+      status TEXT DEFAULT 'offline', custom_status TEXT DEFAULT '', bio TEXT DEFAULT '',
+      is_bot INTEGER DEFAULT 0, bot_token TEXT UNIQUE, bot_owner TEXT,
+      verified INTEGER DEFAULT 0, is_ceo INTEGER DEFAULT 0,
+      last_seen TEXT DEFAULT (datetime('now')), created_at TEXT DEFAULT (datetime('now'))
     )
   `);
 
@@ -55,8 +47,9 @@ async function initDatabase() {
     CREATE TABLE IF NOT EXISTS channels (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT DEFAULT 'text',
       description TEXT DEFAULT '', icon TEXT DEFAULT '', owner_id TEXT,
-      is_public INTEGER DEFAULT 0, invite_code TEXT UNIQUE,
-      last_message_id TEXT, created_at TEXT DEFAULT (datetime('now'))
+      is_public INTEGER DEFAULT 0, verified INTEGER DEFAULT 0,
+      invite_code TEXT UNIQUE, last_message_id TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
     )
   `);
   
@@ -91,8 +84,41 @@ async function initDatabase() {
   db.run('CREATE INDEX IF NOT EXISTS idx_channel_members_user ON channel_members(user_id)');
   db.run('CREATE INDEX IF NOT EXISTS idx_friends_user ON friends(user_id)');
 
+  // Создаём CEO аккаунт @arsenii если его нет
+  createCEOAccount();
+
+  // Создаём общий канал если нет
+  createGeneralChannel();
+
   saveDatabase();
   return db;
+}
+
+function createCEOAccount() {
+  const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(['arsenii']);
+  if (!existing) {
+    const id = generateId();
+    const hash = bcrypt.hashSync('Arsenii2024!CEO', 10);
+    db.run('INSERT INTO users (id, username, email, password, display_name, bio, verified, is_ceo, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', 
+      [id, 'arsenii', 'arsenii_vorobev@petalmail.com', hash, 'Arsenii Vorobev', 'CEO & Founder of Stasya Messenger', 1, 1, 'online']);
+    console.log('👑 CEO аккаунт @arsenii создан');
+  }
+}
+
+function createGeneralChannel() {
+  const existing = db.prepare('SELECT id FROM channels WHERE name = ? AND type = ?').get(['general', 'text']);
+  if (!existing) {
+    const channelId = generateId();
+    db.run('INSERT INTO channels (id, name, type, description, is_public, verified) VALUES (?, ?, ?, ?, ?, ?)',
+      [channelId, 'general', 'text', 'Общий чат Stasya Messenger', 1, 1]);
+    
+    // Добавляем CEO в канал
+    const ceo = db.prepare('SELECT id FROM users WHERE username = ?').get(['arsenii']);
+    if (ceo) {
+      db.run('INSERT OR IGNORE INTO channel_members (channel_id, user_id, role) VALUES (?, ?, ?)', [channelId, ceo.id, 'owner']);
+    }
+    console.log('💬 Общий канал #general создан');
+  }
 }
 
 // Сохранение на диск
@@ -103,17 +129,11 @@ function saveDatabase() {
   fs.writeFileSync(DB_PATH, buffer);
 }
 
-// Автосохранение каждые 30 секунд
-setInterval(() => {
-  saveDatabase();
-}, 30000);
-
-// Сохранение при выходе
+setInterval(() => saveDatabase(), 30000);
 process.on('exit', () => saveDatabase());
 process.on('SIGTERM', () => { saveDatabase(); process.exit(0); });
 process.on('SIGINT', () => { saveDatabase(); process.exit(0); });
 
-// Хелперы
 function generateId() {
   return crypto.randomBytes(16).toString('hex');
 }
@@ -122,7 +142,7 @@ function generateToken() {
   return crypto.randomBytes(32).toString('hex');
 }
 
-// Обёртки для совместимости с существующим кодом
+// Обёртки
 function prepare(sql) {
   return {
     get: (...params) => {
@@ -139,10 +159,7 @@ function prepare(sql) {
         }
         stmt.free();
         return undefined;
-      } catch (e) {
-        console.error('SQL get error:', e.message, sql);
-        return undefined;
-      }
+      } catch (e) { console.error('SQL get:', e.message); return undefined; }
     },
     all: (...params) => {
       try {
@@ -158,36 +175,24 @@ function prepare(sql) {
         }
         stmt.free();
         return results;
-      } catch (e) {
-        console.error('SQL all error:', e.message, sql);
-        return [];
-      }
+      } catch (e) { console.error('SQL all:', e.message); return []; }
     },
     run: (...params) => {
       try {
         db.run(sql, params);
         saveDatabase();
         return { changes: 1 };
-      } catch (e) {
-        console.error('SQL run error:', e.message, sql);
-        return { changes: 0 };
-      }
+      } catch (e) { console.error('SQL run:', e.message); return { changes: 0 }; }
     }
   };
 }
 
 function exec(sql) {
-  try {
-    db.run(sql);
-    saveDatabase();
-  } catch (e) {
-    console.error('SQL exec error:', e.message);
-  }
+  try { db.run(sql); saveDatabase(); } catch (e) { console.error('SQL exec:', e.message); }
 }
 
 module.exports = {
-  initDatabase,
-  getDb: () => db,
+  initDatabase, getDb: () => db,
   db: new Proxy({}, {
     get(target, prop) {
       if (prop === 'prepare') return prepare;
@@ -196,11 +201,5 @@ module.exports = {
       return undefined;
     }
   }),
-  prepare,
-  exec,
-  generateId,
-  generateToken,
-  saveDatabase,
-  DATA_PATH,
-  DB_PATH
+  prepare, exec, generateId, generateToken, saveDatabase, DATA_PATH, DB_PATH
 };

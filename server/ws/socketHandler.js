@@ -12,7 +12,7 @@ module.exports = (io, dataPath) => {
       if (!token) return next(new Error('Требуется авторизация'));
 
       const decoded = jwt.verify(token, JWT_SECRET);
-      const user = db.prepare('SELECT id, username, display_name, avatar, status, is_bot FROM users WHERE id = ?').get(decoded.userId);
+      const user = db.prepare('SELECT id, username, display_name, avatar, status, is_bot, verified, is_ceo FROM users WHERE id = ?').get(decoded.userId);
       if (!user) return next(new Error('Пользователь не найден'));
 
       socket.user = user;
@@ -44,7 +44,7 @@ module.exports = (io, dataPath) => {
     const onlineFriends = [];
     for (const f of friends) {
       if (onlineUsers.has(f.friend_id)) {
-        const friend = db.prepare('SELECT id, username, display_name, avatar, status, custom_status FROM users WHERE id = ?').get(f.friend_id);
+        const friend = db.prepare('SELECT id, username, display_name, avatar, status, custom_status, verified, is_ceo FROM users WHERE id = ?').get(f.friend_id);
         if (friend) onlineFriends.push(friend);
       }
     }
