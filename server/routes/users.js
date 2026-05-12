@@ -1,208 +1,115 @@
 const express = require('express');
 const router = express.Router();
-const User = require('../models/User');
-const { auth } = require('../middleware/auth');
+const { db, generateId } = require('../database');
+const { authMiddleware } = require('./auth');
 
 // Поиск пользователей
-router.get('/search', auth, async (req, res) => {
-  try {
-    const { q } = req.query;
-    if (!q || q.length < 2) {
-      return res.json({ users: [] });
-    }
+router.get('/search', authMiddleware, (req, res) => {
+  const { q } = req.query;
+  if (!q || q.length < 2) return res.json({ users: [] });
 
-    const users = await User.find({
-      $and: [
-        {
-          $or: [
-            { username: { $regex: q, $options: 'i' } },
-            { displayName: { $regex: q, $options: 'i' } }
-          ]
-        },
-        { _id: { $ne: req.user._id } }
-      ]
-    })
-    .select('username displayName avatar status customStatus')
-    .limit(20);
+  const users = db.prepare(`
+    SELECT id, username, display_name, avatar, status, custom_status 
+    FROM users 
+    WHERE (username LIKE ? OR display_name LIKE ?) AND id != ?
+    LIMIT 20
+  `).all(`%${q}%`, `%${q}%`, req.user.id);
 
-    res.json({ users });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка поиска' });
-  }
+  res.json({ users });
 });
 
-// Получить пользователя по username
-router.get('/:username', auth, async (req, res) => {
-  try {
-    const user = await User.findOne({ 
-      username: req.params.username.toLowerCase() 
-    }).select('-password -botToken -email');
-
-    if (!user) {
-      return res.status(404).json({ error: 'Пользователь не найден' });
-    }
-
-    res.json({ user: user.toJSON() });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка получения пользователя' });
-  }
+// Получить пользователя
+router.get('/:username', authMiddleware, (req, res) => {
+  const user = db.prepare('SELECT id, username, display_name, avatar, status, custom_status, bio, is_bot, last_seen, created_at FROM users WHERE username = ?').get(req.params.username.toLowerCase());
+  if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
+  res.json({ user });
 });
 
 // Друзья
-router.get('/:id/friends', auth, async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id)
-      .populate('friends', 'username displayName avatar status customStatus');
-    
-    if (!user) {
-      return res.status(404).json({ error: 'Пользователь не найден' });
-    }
-
-    res.json({ friends: user.friends });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка получения друзей' });
-  }
+router.get('/:id/friends', authMiddleware, (req, res) => {
+  const friends = db.prepare(`
+    SELECT u.id, u.username, u.display_name, u.avatar, u.status, u.custom_status 
+    FROM friends f JOIN users u ON f.friend_id = u.id 
+    WHERE f.user_id = ?
+  `).all(req.params.id);
+  res.json({ friends });
 });
 
 // Отправить запрос в друзья
-router.post('/friend-request/:userId', auth, async (req, res) => {
+router.post('/friend-request/:userId', authMiddleware, (req, res) => {
   try {
-    if (req.params.userId === req.user._id.toString()) {
-      return res.status(400).json({ error: 'Нельзя добавить себя в друзья' });
+    if (req.params.userId === req.user.id) {
+      return res.status(400).json({ error: 'Нельзя добавить себя' });
     }
 
-    const targetUser = await User.findById(req.params.userId);
-    if (!targetUser) {
-      return res.status(404).json({ error: 'Пользователь не найден' });
-    }
+    const target = db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.userId);
+    if (!target) return res.status(404).json({ error: 'Пользователь не найден' });
 
-    // Проверка на блокировку
-    if (targetUser.blocked.includes(req.user._id)) {
-      return res.status(403).json({ error: 'Вы заблокированы этим пользователем' });
-    }
+    // Проверка блокировки
+    const blocked = db.prepare('SELECT 1 FROM blocked WHERE user_id = ? AND blocked_id = ?').get(req.params.userId, req.user.id);
+    if (blocked) return res.status(403).json({ error: 'Вы заблокированы' });
 
     // Уже друзья?
-    if (targetUser.friends.includes(req.user._id)) {
-      return res.status(400).json({ error: 'Вы уже друзья' });
-    }
+    const alreadyFriend = db.prepare('SELECT 1 FROM friends WHERE user_id = ? AND friend_id = ?').get(req.user.id, req.params.userId);
+    if (alreadyFriend) return res.status(400).json({ error: 'Вы уже друзья' });
 
     // Уже отправлен запрос?
-    const existingRequest = targetUser.friendRequests.find(
-      r => r.from.toString() === req.user._id.toString()
-    );
-    if (existingRequest) {
-      return res.status(400).json({ error: 'Запрос уже отправлен' });
-    }
+    const existing = db.prepare('SELECT id FROM friend_requests WHERE from_user = ? AND to_user = ?').get(req.user.id, req.params.userId);
+    if (existing) return res.status(400).json({ error: 'Запрос уже отправлен' });
 
-    targetUser.friendRequests.push({ from: req.user._id });
-    await targetUser.save();
+    db.prepare('INSERT INTO friend_requests (id, from_user, to_user) VALUES (?, ?, ?)').run(generateId(), req.user.id, req.params.userId);
 
-    // Уведомление через WebSocket
     const io = req.app.get('io');
-    io.to(`user:${targetUser._id}`).emit('friendRequest', {
-      from: {
-        _id: req.user._id,
-        username: req.user.username,
-        displayName: req.user.displayName,
-        avatar: req.user.avatar
-      }
+    io.to(`user:${req.params.userId}`).emit('friendRequest', {
+      from: { id: req.user.id, username: req.user.username, display_name: req.user.display_name, avatar: req.user.avatar }
     });
 
     res.json({ message: 'Запрос отправлен' });
   } catch (error) {
-    res.status(500).json({ error: 'Ошибка отправки запроса' });
+    res.status(500).json({ error: 'Ошибка' });
   }
 });
 
-// Принять запрос в друзья
-router.post('/friend-request/:userId/accept', auth, async (req, res) => {
+// Принять запрос
+router.post('/friend-request/:userId/accept', authMiddleware, (req, res) => {
   try {
-    const requestIndex = req.user.friendRequests.findIndex(
-      r => r.from.toString() === req.params.userId
-    );
+    const request = db.prepare('SELECT id FROM friend_requests WHERE from_user = ? AND to_user = ?').get(req.params.userId, req.user.id);
+    if (!request) return res.status(404).json({ error: 'Запрос не найден' });
 
-    if (requestIndex === -1) {
-      return res.status(404).json({ error: 'Запрос не найден' });
-    }
+    db.prepare('INSERT OR IGNORE INTO friends (user_id, friend_id) VALUES (?, ?)').run(req.user.id, req.params.userId);
+    db.prepare('INSERT OR IGNORE INTO friends (user_id, friend_id) VALUES (?, ?)').run(req.params.userId, req.user.id);
+    db.prepare('DELETE FROM friend_requests WHERE id = ?').run(request.id);
 
-    const friendUser = await User.findById(req.params.userId);
-    if (!friendUser) {
-      return res.status(404).json({ error: 'Пользователь не найден' });
-    }
+    const friend = db.prepare('SELECT id, username, display_name, avatar, status FROM users WHERE id = ?').get(req.params.userId);
 
-    // Добавляем друг друга
-    req.user.friends.push(friendUser._id);
-    friendUser.friends.push(req.user._id);
-
-    // Удаляем запрос
-    req.user.friendRequests.splice(requestIndex, 1);
-
-    await req.user.save();
-    await friendUser.save();
-
-    // Уведомление
     const io = req.app.get('io');
-    io.to(`user:${friendUser._id}`).emit('friendAccepted', {
-      user: {
-        _id: req.user._id,
-        username: req.user.username,
-        displayName: req.user.displayName,
-        avatar: req.user.avatar
-      }
+    io.to(`user:${req.params.userId}`).emit('friendAccepted', {
+      user: { id: req.user.id, username: req.user.username, display_name: req.user.display_name, avatar: req.user.avatar }
     });
 
-    res.json({ message: 'Запрос принят', friend: friendUser.toJSON() });
+    res.json({ message: 'Запрос принят', friend });
   } catch (error) {
-    res.status(500).json({ error: 'Ошибка принятия запроса' });
+    res.status(500).json({ error: 'Ошибка' });
   }
 });
 
 // Отклонить запрос
-router.post('/friend-request/:userId/reject', auth, async (req, res) => {
-  try {
-    req.user.friendRequests = req.user.friendRequests.filter(
-      r => r.from.toString() !== req.params.userId
-    );
-    await req.user.save();
-    res.json({ message: 'Запрос отклонён' });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка отклонения запроса' });
-  }
+router.post('/friend-request/:userId/reject', authMiddleware, (req, res) => {
+  db.prepare('DELETE FROM friend_requests WHERE from_user = ? AND to_user = ?').run(req.params.userId, req.user.id);
+  res.json({ message: 'Запрос отклонён' });
 });
 
 // Удалить из друзей
-router.delete('/friend/:userId', auth, async (req, res) => {
-  try {
-    req.user.friends = req.user.friends.filter(
-      f => f.toString() !== req.params.userId
-    );
-    await req.user.save();
-
-    await User.findByIdAndUpdate(req.params.userId, {
-      $pull: { friends: req.user._id }
-    });
-
-    res.json({ message: 'Пользователь удалён из друзей' });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка удаления из друзей' });
-  }
+router.delete('/friend/:userId', authMiddleware, (req, res) => {
+  db.prepare('DELETE FROM friends WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)').run(req.user.id, req.params.userId, req.params.userId, req.user.id);
+  res.json({ message: 'Удалён из друзей' });
 });
 
 // Заблокировать
-router.post('/block/:userId', auth, async (req, res) => {
-  try {
-    if (!req.user.blocked.includes(req.params.userId)) {
-      req.user.blocked.push(req.params.userId);
-      // Удаляем из друзей если есть
-      req.user.friends = req.user.friends.filter(
-        f => f.toString() !== req.params.userId
-      );
-      await req.user.save();
-    }
-    res.json({ message: 'Пользователь заблокирован' });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка блокировки' });
-  }
+router.post('/block/:userId', authMiddleware, (req, res) => {
+  db.prepare('INSERT OR IGNORE INTO blocked (user_id, blocked_id) VALUES (?, ?)').run(req.user.id, req.params.userId);
+  db.prepare('DELETE FROM friends WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)').run(req.user.id, req.params.userId, req.params.userId, req.user.id);
+  res.json({ message: 'Заблокирован' });
 });
 
 module.exports = router;

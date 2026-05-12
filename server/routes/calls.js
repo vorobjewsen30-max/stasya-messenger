@@ -1,62 +1,34 @@
 const express = require('express');
 const router = express.Router();
-const Call = require('../models/Call');
-const Channel = require('../models/Channel');
-const { auth } = require('../middleware/auth');
+const { db, generateId } = require('../database');
+const { authMiddleware } = require('./auth');
 
 // Начать звонок
-router.post('/start/:channelId', auth, async (req, res) => {
+router.post('/start/:channelId', authMiddleware, (req, res) => {
   try {
     const { type = 'voice' } = req.body;
-    const channel = await Channel.findById(req.params.channelId);
+    const channel = db.prepare('SELECT * FROM channels WHERE id = ?').get(req.params.channelId);
+    if (!channel) return res.status(404).json({ error: 'Канал не найден' });
 
-    if (!channel) {
-      return res.status(404).json({ error: 'Канал не найден' });
-    }
+    const member = db.prepare('SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?').get(channel.id, req.user.id);
+    if (!member) return res.status(403).json({ error: 'Вы не участник' });
 
-    const isMember = channel.members.some(
-      m => m.user.toString() === req.user._id.toString()
-    );
-    if (!isMember) {
-      return res.status(403).json({ error: 'Вы не участник канала' });
-    }
+    const activeCall = db.prepare('SELECT id FROM calls WHERE channel_id = ? AND status IN (\'ringing\', \'active\')').get(channel.id);
+    if (activeCall) return res.status(400).json({ error: 'В канале уже идёт звонок' });
 
-    // Проверяем активные звонки в канале
-    const activeCall = await Call.findOne({
-      channel: channel._id,
-      status: { $in: ['ringing', 'active'] }
-    });
+    const callId = generateId();
+    db.prepare('INSERT INTO calls (id, channel_id, initiator_id, type) VALUES (?, ?, ?, ?)').run(callId, channel.id, req.user.id, type);
+    db.prepare('INSERT INTO call_participants (call_id, user_id, is_video) VALUES (?, ?, ?)').run(callId, req.user.id, type === 'video' ? 1 : 0);
 
-    if (activeCall) {
-      return res.status(400).json({ error: 'В канале уже идёт звонок' });
-    }
+    const call = getCall(callId);
 
-    const call = new Call({
-      channel: channel._id,
-      initiator: req.user._id,
-      type,
-      participants: [{
-        user: req.user._id,
-        isVideo: type === 'video'
-      }]
-    });
-
-    await call.save();
-    await call.populate('participants.user', 'username displayName avatar');
-
-    // Уведомляем участников канала
     const io = req.app.get('io');
-    io.to(`channel:${channel._id}`).emit('callStarted', {
+    io.to(`channel:${channel.id}`).emit('callStarted', {
       call: {
-        _id: call._id,
-        channelId: channel._id,
+        id: call.id,
+        channelId: channel.id,
         channelName: channel.name,
-        initiator: {
-          _id: req.user._id,
-          username: req.user.username,
-          displayName: req.user.displayName,
-          avatar: req.user.avatar
-        },
+        initiator: { id: req.user.id, username: req.user.username, display_name: req.user.display_name, avatar: req.user.avatar },
         type,
         status: 'ringing'
       }
@@ -64,147 +36,105 @@ router.post('/start/:channelId', auth, async (req, res) => {
 
     res.status(201).json({ call });
   } catch (error) {
-    console.error('Ошибка начала звонка:', error);
-    res.status(500).json({ error: 'Ошибка начала звонка' });
+    console.error('Ошибка звонка:', error);
+    res.status(500).json({ error: 'Ошибка' });
   }
 });
 
-// Присоединиться к звонку
-router.post('/:callId/join', auth, async (req, res) => {
+// Присоединиться
+router.post('/:callId/join', authMiddleware, (req, res) => {
   try {
-    const call = await Call.findById(req.params.callId);
-    
-    if (!call) {
-      return res.status(404).json({ error: 'Звонок не найден' });
-    }
+    const call = db.prepare('SELECT * FROM calls WHERE id = ?').get(req.params.callId);
+    if (!call) return res.status(404).json({ error: 'Звонок не найден' });
+    if (call.status === 'ended') return res.status(400).json({ error: 'Звонок завершён' });
 
-    if (call.status === 'ended') {
-      return res.status(400).json({ error: 'Звонок завершён' });
-    }
+    const participant = db.prepare('SELECT 1 FROM call_participants WHERE call_id = ? AND user_id = ? AND left_at IS NULL').get(call.id, req.user.id);
+    if (participant) return res.status(400).json({ error: 'Вы уже в звонке' });
 
-    const isParticipant = call.participants.find(
-      p => p.user.toString() === req.user._id.toString() && !p.leftAt
-    );
-
-    if (isParticipant) {
-      return res.status(400).json({ error: 'Вы уже в звонке' });
-    }
-
-    call.participants.push({
-      user: req.user._id,
-      isVideo: req.body.video || false
-    });
+    db.prepare('INSERT INTO call_participants (call_id, user_id, is_video) VALUES (?, ?, ?)').run(call.id, req.user.id, req.body.video ? 1 : 0);
 
     if (call.status === 'ringing') {
-      call.status = 'active';
+      db.prepare('UPDATE calls SET status = ? WHERE id = ?').run('active', call.id);
     }
 
-    await call.save();
-    await call.populate('participants.user', 'username displayName avatar');
+    const updatedCall = getCall(call.id);
 
     const io = req.app.get('io');
-    io.to(`channel:${call.channel}`).emit('callParticipantJoined', {
-      callId: call._id,
-      user: {
-        _id: req.user._id,
-        username: req.user.username,
-        displayName: req.user.displayName,
-        avatar: req.user.avatar
-      }
+    io.to(`channel:${call.channel_id}`).emit('callParticipantJoined', {
+      callId: call.id,
+      user: { id: req.user.id, username: req.user.username, display_name: req.user.display_name, avatar: req.user.avatar }
     });
 
-    res.json({ call });
+    res.json({ call: updatedCall });
   } catch (error) {
-    res.status(500).json({ error: 'Ошибка присоединения к звонку' });
+    res.status(500).json({ error: 'Ошибка' });
   }
 });
 
 // Покинуть звонок
-router.post('/:callId/leave', auth, async (req, res) => {
+router.post('/:callId/leave', authMiddleware, (req, res) => {
   try {
-    const call = await Call.findById(req.params.callId);
+    const call = db.prepare('SELECT * FROM calls WHERE id = ?').get(req.params.callId);
+    if (!call) return res.status(404).json({ error: 'Звонок не найден' });
+
+    db.prepare('UPDATE call_participants SET left_at = datetime(\'now\') WHERE call_id = ? AND user_id = ? AND left_at IS NULL').run(call.id, req.user.id);
+
+    const activeParticipants = db.prepare('SELECT COUNT(*) as count FROM call_participants WHERE call_id = ? AND left_at IS NULL').get(call.id);
     
-    if (!call) {
-      return res.status(404).json({ error: 'Звонок не найден' });
-    }
-
-    const participant = call.participants.find(
-      p => p.user.toString() === req.user._id.toString() && !p.leftAt
-    );
-
-    if (!participant) {
-      return res.status(400).json({ error: 'Вы не в звонке' });
-    }
-
-    participant.leftAt = new Date();
-    
-    // Проверяем остались ли участники
-    const activeParticipants = call.participants.filter(p => !p.leftAt);
-    if (activeParticipants.length === 0) {
-      call.status = 'ended';
-      call.endedAt = new Date();
-      call.duration = Math.floor((call.endedAt - call.startedAt) / 1000);
-    }
-
-    await call.save();
-
     const io = req.app.get('io');
-    io.to(`channel:${call.channel}`).emit('callParticipantLeft', {
-      callId: call._id,
-      userId: req.user._id
-    });
+    io.to(`channel:${call.channel_id}`).emit('callParticipantLeft', { callId: call.id, userId: req.user.id });
 
-    if (call.status === 'ended') {
-      io.to(`channel:${call.channel}`).emit('callEnded', {
-        callId: call._id,
-        duration: call.duration
-      });
+    if (activeParticipants.count === 0) {
+      db.prepare('UPDATE calls SET status = ?, ended_at = datetime(\'now\'), duration = (julianday(\'now\') - julianday(started_at)) * 86400 WHERE id = ?').run('ended', call.id);
+      io.to(`channel:${call.channel_id}`).emit('callEnded', { callId: call.id });
     }
 
-    res.json({ call });
+    const updatedCall = getCall(call.id);
+    res.json({ call: updatedCall });
   } catch (error) {
-    res.status(500).json({ error: 'Ошибка выхода из звонка' });
+    res.status(500).json({ error: 'Ошибка' });
   }
 });
 
-// Получить активные звонки пользователя
-router.get('/active', auth, async (req, res) => {
-  try {
-    const calls = await Call.find({
-      status: { $in: ['ringing', 'active'] },
-      'participants.user': req.user._id,
-      'participants.leftAt': null
-    })
-    .populate('participants.user', 'username displayName avatar')
-    .populate('channel', 'name');
+// Активные звонки
+router.get('/active', authMiddleware, (req, res) => {
+  const calls = db.prepare(`
+    SELECT DISTINCT c.* FROM calls c
+    JOIN call_participants cp ON c.id = cp.call_id
+    WHERE cp.user_id = ? AND cp.left_at IS NULL AND c.status IN ('ringing', 'active')
+  `).all(req.user.id);
 
-    res.json({ calls });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка получения звонков' });
-  }
+  const result = calls.map(call => getCall(call.id));
+  res.json({ calls: result });
 });
 
-// WebRTC сигналинг
-router.post('/signal/:callId', auth, async (req, res) => {
-  try {
-    const { targetUserId, signal } = req.body;
-    const call = await Call.findById(req.params.callId);
+// Сигналинг
+router.post('/signal/:callId', authMiddleware, (req, res) => {
+  const { targetUserId, signal } = req.body;
+  const call = db.prepare('SELECT * FROM calls WHERE id = ?').get(req.params.callId);
+  if (!call) return res.status(404).json({ error: 'Звонок не найден' });
 
-    if (!call) {
-      return res.status(404).json({ error: 'Звонок не найден' });
-    }
+  const io = req.app.get('io');
+  io.to(`user:${targetUserId}`).emit('callSignal', { callId: call.id, fromUserId: req.user.id, signal });
 
-    const io = req.app.get('io');
-    io.to(`user:${targetUserId}`).emit('callSignal', {
-      callId: call._id,
-      fromUserId: req.user._id,
-      signal
-    });
-
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка сигналинга' });
-  }
+  res.json({ success: true });
 });
+
+// ===== ХЕЛПЕР =====
+
+function getCall(id) {
+  const call = db.prepare('SELECT * FROM calls WHERE id = ?').get(id);
+  if (!call) return null;
+
+  const participants = db.prepare(`
+    SELECT u.id, u.username, u.display_name, u.avatar, cp.*
+    FROM call_participants cp JOIN users u ON cp.user_id = u.id
+    WHERE cp.call_id = ?
+  `).all(id);
+
+  const channel = db.prepare('SELECT id, name FROM channels WHERE id = ?').get(call.channel_id);
+
+  return { ...call, participants, channel };
+}
 
 module.exports = router;

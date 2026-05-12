@@ -1,5 +1,5 @@
 # Render Deployment Configuration
-# Render Disk mount path: /var/data
+# База данных: SQLite (хранится на Render Disk)
 
 services:
   - type: web
@@ -15,8 +15,6 @@ services:
         value: production
       - key: PORT
         value: 3000
-      - key: MONGODB_URI
-        sync: false
       - key: JWT_SECRET
         sync: false
       - key: RENDER_DISK_PATH
@@ -24,5 +22,5 @@ services:
     disk:
       name: stasya-data
       mountPath: /var/data
-      sizeGB: 10
+      sizeGB: 1
     autoDeploy: true

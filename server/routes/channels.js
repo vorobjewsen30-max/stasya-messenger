@@ -1,40 +1,22 @@
 const express = require('express');
 const router = express.Router();
-const Channel = require('../models/Channel');
-const User = require('../models/User');
-const { auth } = require('../middleware/auth');
+const { db, generateId } = require('../database');
+const { authMiddleware } = require('./auth');
 const crypto = require('crypto');
 
-// Создать канал/группу
-router.post('/', auth, async (req, res) => {
+// Создать канал
+router.post('/', authMiddleware, (req, res) => {
   try {
     const { name, type, description, isPublic } = req.body;
+    if (!name || name.length < 2) return res.status(400).json({ error: 'Название должно быть не менее 2 символов' });
 
-    if (!name || name.length < 2) {
-      return res.status(400).json({ error: 'Название канала должно быть не менее 2 символов' });
-    }
+    const id = generateId();
+    const inviteCode = (isPublic || type === 'group') ? crypto.randomBytes(6).toString('hex') : null;
 
-    const channel = new Channel({
-      name,
-      type: type || 'text',
-      description: description || '',
-      isPublic: isPublic || false,
-      owner: req.user._id,
-      members: [{
-        user: req.user._id,
-        role: 'owner'
-      }]
-    });
+    db.prepare('INSERT INTO channels (id, name, type, description, owner_id, is_public, invite_code) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, name, type || 'text', description || '', req.user.id, isPublic ? 1 : 0, inviteCode);
+    db.prepare('INSERT INTO channel_members (channel_id, user_id, role) VALUES (?, ?, ?)').run(id, req.user.id, 'owner');
 
-    if (isPublic || type === 'group') {
-      channel.generateInvite();
-    }
-
-    await channel.save();
-
-    // Популируем members
-    await channel.populate('members.user', 'username displayName avatar status');
-
+    const channel = getChannel(id);
     res.status(201).json({ channel });
   } catch (error) {
     console.error('Ошибка создания канала:', error);
@@ -43,186 +25,135 @@ router.post('/', auth, async (req, res) => {
 });
 
 // Получить каналы пользователя
-router.get('/', auth, async (req, res) => {
-  try {
-    const channels = await Channel.find({
-      'members.user': req.user._id
-    })
-    .populate('members.user', 'username displayName avatar status')
-    .populate('lastMessage')
-    .sort({ updatedAt: -1 });
+router.get('/', authMiddleware, (req, res) => {
+  const channels = db.prepare(`
+    SELECT c.* FROM channels c 
+    JOIN channel_members cm ON c.id = cm.channel_id 
+    WHERE cm.user_id = ?
+    ORDER BY c.created_at DESC
+  `).all(req.user.id);
 
-    res.json({ channels });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка получения каналов' });
-  }
+  const result = channels.map(ch => enrichChannel(ch));
+  res.json({ channels: result });
 });
 
-// Получить конкретный канал
-router.get('/:channelId', auth, async (req, res) => {
-  try {
-    const channel = await Channel.findById(req.params.channelId)
-      .populate('members.user', 'username displayName avatar status customStatus')
-      .populate('lastMessage');
+// Получить канал
+router.get('/:channelId', authMiddleware, (req, res) => {
+  const channel = db.prepare('SELECT * FROM channels WHERE id = ?').get(req.params.channelId);
+  if (!channel) return res.status(404).json({ error: 'Канал не найден' });
 
-    if (!channel) {
-      return res.status(404).json({ error: 'Канал не найден' });
-    }
+  const member = db.prepare('SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?').get(channel.id, req.user.id);
+  if (!member && !channel.is_public) return res.status(403).json({ error: 'Нет доступа' });
 
-    // Проверка доступа
-    const isMember = channel.members.some(
-      m => m.user._id.toString() === req.user._id.toString()
-    );
-    if (!isMember && !channel.isPublic) {
-      return res.status(403).json({ error: 'Нет доступа к каналу' });
-    }
-
-    res.json({ channel });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка получения канала' });
-  }
+  res.json({ channel: enrichChannel(channel) });
 });
 
-// Присоединиться по инвайт-коду
-router.post('/join/:inviteCode', auth, async (req, res) => {
-  try {
-    const channel = await Channel.findOne({ inviteCode: req.params.inviteCode });
+// Присоединиться по инвайту
+router.post('/join/:inviteCode', authMiddleware, (req, res) => {
+  const channel = db.prepare('SELECT * FROM channels WHERE invite_code = ?').get(req.params.inviteCode);
+  if (!channel) return res.status(404).json({ error: 'Неверный код' });
 
-    if (!channel) {
-      return res.status(404).json({ error: 'Неверный код приглашения' });
-    }
+  const member = db.prepare('SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?').get(channel.id, req.user.id);
+  if (member) return res.status(400).json({ error: 'Вы уже участник' });
 
-    const isMember = channel.members.some(
-      m => m.user.toString() === req.user._id.toString()
-    );
+  db.prepare('INSERT INTO channel_members (channel_id, user_id, role) VALUES (?, ?, ?)').run(channel.id, req.user.id, 'member');
 
-    if (isMember) {
-      return res.status(400).json({ error: 'Вы уже участник' });
-    }
+  const io = req.app.get('io');
+  io.to(`channel:${channel.id}`).emit('memberJoined', {
+    channelId: channel.id,
+    user: { id: req.user.id, username: req.user.username, display_name: req.user.display_name, avatar: req.user.avatar }
+  });
 
-    channel.members.push({
-      user: req.user._id,
-      role: 'member'
-    });
-
-    await channel.save();
-    await channel.populate('members.user', 'username displayName avatar status');
-
-    // Уведомление через WebSocket
-    const io = req.app.get('io');
-    io.to(`channel:${channel._id}`).emit('memberJoined', {
-      channelId: channel._id,
-      user: {
-        _id: req.user._id,
-        username: req.user.username,
-        displayName: req.user.displayName,
-        avatar: req.user.avatar
-      }
-    });
-
-    res.json({ channel });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка присоединения' });
-  }
+  res.json({ channel: enrichChannel(channel) });
 });
 
 // Создать инвайт
-router.post('/:channelId/invite', auth, async (req, res) => {
-  try {
-    const channel = await Channel.findById(req.params.channelId);
-    if (!channel) {
-      return res.status(404).json({ error: 'Канал не найден' });
-    }
+router.post('/:channelId/invite', authMiddleware, (req, res) => {
+  const channel = db.prepare('SELECT * FROM channels WHERE id = ?').get(req.params.channelId);
+  if (!channel) return res.status(404).json({ error: 'Канал не найден' });
 
-    const member = channel.members.find(
-      m => m.user.toString() === req.user._id.toString()
-    );
-    if (!member || !['owner', 'admin', 'moderator'].includes(member.role)) {
-      return res.status(403).json({ error: 'Недостаточно прав' });
-    }
+  const member = db.prepare('SELECT role FROM channel_members WHERE channel_id = ? AND user_id = ?').get(channel.id, req.user.id);
+  if (!member || !['owner', 'admin', 'moderator'].includes(member.role)) return res.status(403).json({ error: 'Недостаточно прав' });
 
-    channel.generateInvite();
-    await channel.save();
+  const inviteCode = crypto.randomBytes(6).toString('hex');
+  db.prepare('UPDATE channels SET invite_code = ? WHERE id = ?').run(inviteCode, channel.id);
 
-    res.json({ inviteCode: channel.inviteCode });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка создания инвайта' });
-  }
+  res.json({ inviteCode });
 });
 
-// Создать DM (личные сообщения)
-router.post('/dm/:userId', auth, async (req, res) => {
-  try {
-    if (req.params.userId === req.user._id.toString()) {
-      return res.status(400).json({ error: 'Нельзя создать DM с собой' });
-    }
+// Создать DM
+router.post('/dm/:userId', authMiddleware, (req, res) => {
+  if (req.params.userId === req.user.id) return res.status(400).json({ error: 'Нельзя создать DM с собой' });
 
-    const otherUser = await User.findById(req.params.userId);
-    if (!otherUser) {
-      return res.status(404).json({ error: 'Пользователь не найден' });
-    }
+  const other = db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.userId);
+  if (!other) return res.status(404).json({ error: 'Пользователь не найден' });
 
-    // Проверяем существующий DM
-    let dm = await Channel.findOne({
-      type: 'dm',
-      'members.user': { $all: [req.user._id, otherUser._id] },
-      $expr: { $eq: [{ $size: '$members' }, 2] }
-    }).populate('members.user', 'username displayName avatar status');
+  // Ищем существующий DM
+  const existingDM = db.prepare(`
+    SELECT c.id FROM channels c
+    WHERE c.type = 'dm' 
+    AND (SELECT COUNT(*) FROM channel_members WHERE channel_id = c.id) = 2
+    AND EXISTS (SELECT 1 FROM channel_members WHERE channel_id = c.id AND user_id = ?)
+    AND EXISTS (SELECT 1 FROM channel_members WHERE channel_id = c.id AND user_id = ?)
+  `).get(req.user.id, req.params.userId);
 
-    if (dm) {
-      return res.json({ channel: dm });
-    }
-
-    // Создаём новый DM
-    dm = new Channel({
-      name: `${req.user.username}-${otherUser.username}`,
-      type: 'dm',
-      members: [
-        { user: req.user._id, role: 'member' },
-        { user: otherUser._id, role: 'member' }
-      ]
-    });
-
-    await dm.save();
-    await dm.populate('members.user', 'username displayName avatar status');
-
-    res.status(201).json({ channel: dm });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка создания DM' });
+  if (existingDM) {
+    const channel = db.prepare('SELECT * FROM channels WHERE id = ?').get(existingDM.id);
+    return res.json({ channel: enrichChannel(channel) });
   }
+
+  const id = generateId();
+  db.prepare('INSERT INTO channels (id, name, type) VALUES (?, ?, ?)').run(id, `${req.user.username}-${other.id}`, 'dm');
+  db.prepare('INSERT INTO channel_members (channel_id, user_id, role) VALUES (?, ?, ?)').run(id, req.user.id, 'member');
+  db.prepare('INSERT INTO channel_members (channel_id, user_id, role) VALUES (?, ?, ?)').run(id, req.params.userId, 'member');
+
+  const channel = db.prepare('SELECT * FROM channels WHERE id = ?').get(id);
+  res.status(201).json({ channel: enrichChannel(channel) });
 });
 
 // Покинуть канал
-router.post('/:channelId/leave', auth, async (req, res) => {
-  try {
-    const channel = await Channel.findById(req.params.channelId);
-    if (!channel) {
-      return res.status(404).json({ error: 'Канал не найден' });
-    }
+router.post('/:channelId/leave', authMiddleware, (req, res) => {
+  const channel = db.prepare('SELECT * FROM channels WHERE id = ?').get(req.params.channelId);
+  if (!channel) return res.status(404).json({ error: 'Канал не найден' });
 
-    channel.members = channel.members.filter(
-      m => m.user.toString() !== req.user._id.toString()
-    );
+  db.prepare('DELETE FROM channel_members WHERE channel_id = ? AND user_id = ?').run(channel.id, req.user.id);
 
-    if (channel.members.length === 0) {
-      await Channel.findByIdAndDelete(channel._id);
-      return res.json({ message: 'Канал удалён' });
-    }
-
-    // Передаём владение если owner уходит
-    if (channel.owner?.toString() === req.user._id.toString()) {
-      const newOwner = channel.members.find(m => m.role === 'admin') || channel.members[0];
-      if (newOwner) {
-        newOwner.role = 'owner';
-        channel.owner = newOwner.user;
-      }
-    }
-
-    await channel.save();
-    res.json({ message: 'Вы покинули канал' });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка выхода из канала' });
+  const remaining = db.prepare('SELECT COUNT(*) as count FROM channel_members WHERE channel_id = ?').get(channel.id);
+  if (remaining.count === 0) {
+    db.prepare('DELETE FROM channels WHERE id = ?').run(channel.id);
+    return res.json({ message: 'Канал удалён' });
   }
+
+  if (channel.owner_id === req.user.id) {
+    const newOwner = db.prepare('SELECT user_id FROM channel_members WHERE channel_id = ? AND role = ?').get(channel.id, 'admin')
+      || db.prepare('SELECT user_id FROM channel_members WHERE channel_id = ? LIMIT 1').get(channel.id);
+    if (newOwner) {
+      db.prepare('UPDATE channel_members SET role = ? WHERE channel_id = ? AND user_id = ?').run('owner', channel.id, newOwner.user_id);
+      db.prepare('UPDATE channels SET owner_id = ? WHERE id = ?').run(newOwner.user_id, channel.id);
+    }
+  }
+
+  res.json({ message: 'Вы покинули канал' });
 });
+
+// ===== ХЕЛПЕРЫ =====
+
+function getChannel(id) {
+  return db.prepare('SELECT * FROM channels WHERE id = ?').get(id);
+}
+
+function enrichChannel(channel) {
+  const members = db.prepare(`
+    SELECT u.id, u.username, u.display_name, u.avatar, u.status, u.custom_status, cm.role
+    FROM channel_members cm JOIN users u ON cm.user_id = u.id
+    WHERE cm.channel_id = ?
+  `).all(channel.id);
+
+  const lastMessage = channel.last_message_id 
+    ? db.prepare('SELECT * FROM messages WHERE id = ?').get(channel.last_message_id) 
+    : null;
+
+  return { ...channel, members, lastMessage };
+}
 
 module.exports = router;

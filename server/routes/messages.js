@@ -1,47 +1,43 @@
 const express = require('express');
 const router = express.Router();
-const Message = require('../models/Message');
-const Channel = require('../models/Channel');
-const { auth, botAuth } = require('../middleware/auth');
+const { db, generateId } = require('../database');
+const { authMiddleware, botAuthMiddleware } = require('./auth');
 
-// Получить сообщения канала (с пагинацией)
-router.get('/:channelId', auth, async (req, res) => {
+// Получить сообщения
+router.get('/:channelId', authMiddleware, (req, res) => {
   try {
     const { before, limit = 50 } = req.query;
     const channelId = req.params.channelId;
 
-    // Проверка доступа к каналу
-    const channel = await Channel.findById(channelId);
-    if (!channel) {
-      return res.status(404).json({ error: 'Канал не найден' });
-    }
+    const channel = db.prepare('SELECT * FROM channels WHERE id = ?').get(channelId);
+    if (!channel) return res.status(404).json({ error: 'Канал не найден' });
 
-    const isMember = channel.members.some(
-      m => m.user.toString() === req.user._id.toString()
-    );
-    if (!isMember && !channel.isPublic) {
-      return res.status(403).json({ error: 'Нет доступа' });
-    }
+    const member = db.prepare('SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?').get(channelId, req.user.id);
+    if (!member && !channel.is_public) return res.status(403).json({ error: 'Нет доступа' });
 
-    const query = { channel: channelId, deleted: false };
+    let query = 'SELECT * FROM messages WHERE channel_id = ? AND deleted = 0';
+    const params = [channelId];
+
     if (before) {
-      query.createdAt = { $lt: new Date(before) };
+      query += ' AND created_at < ?';
+      params.push(before);
     }
 
-    const messages = await Message.find(query)
-      .populate('author', 'username displayName avatar isBot')
-      .populate('replyTo')
-      .sort({ createdAt: -1 })
-      .limit(Math.min(parseInt(limit), 100));
+    query += ' ORDER BY created_at DESC LIMIT ?';
+    params.push(Math.min(parseInt(limit), 100));
 
-    res.json({ messages: messages.reverse() });
+    const messages = db.prepare(query).all(...params);
+    const enriched = messages.reverse().map(enrichMessage);
+
+    res.json({ messages: enriched });
   } catch (error) {
-    res.status(500).json({ error: 'Ошибка получения сообщений' });
+    console.error('Ошибка получения сообщений:', error);
+    res.status(500).json({ error: 'Ошибка' });
   }
 });
 
 // Отправить сообщение
-router.post('/:channelId', auth, async (req, res) => {
+router.post('/:channelId', authMiddleware, (req, res) => {
   try {
     const { content, type, attachments, embed, replyTo } = req.body;
     const channelId = req.params.channelId;
@@ -50,241 +46,227 @@ router.post('/:channelId', auth, async (req, res) => {
       return res.status(400).json({ error: 'Сообщение не может быть пустым' });
     }
 
-    // Проверка доступа
-    const channel = await Channel.findById(channelId);
-    if (!channel) {
-      return res.status(404).json({ error: 'Канал не найден' });
+    const channel = db.prepare('SELECT * FROM channels WHERE id = ?').get(channelId);
+    if (!channel) return res.status(404).json({ error: 'Канал не найден' });
+
+    const member = db.prepare('SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?').get(channelId, req.user.id);
+    if (!member) return res.status(403).json({ error: 'Вы не участник' });
+
+    const messageId = generateId();
+
+    db.prepare(`
+      INSERT INTO messages (id, channel_id, author_id, content, type, reply_to)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(messageId, channelId, req.user.id, content || '', type || (embed ? 'embed' : 'text'), replyTo || null);
+
+    // Вложения
+    if (attachments?.length) {
+      const insertAttach = db.prepare('INSERT INTO attachments (id, message_id, filename, url, size, mime_type) VALUES (?, ?, ?, ?, ?, ?)');
+      for (const att of attachments) {
+        insertAttach.run(generateId(), messageId, att.filename, att.url, att.size, att.mimeType);
+      }
     }
 
-    const isMember = channel.members.some(
-      m => m.user.toString() === req.user._id.toString()
-    );
-    if (!isMember) {
-      return res.status(403).json({ error: 'Вы не участник канала' });
+    // Embed
+    if (embed) {
+      const embedId = generateId();
+      db.prepare('INSERT INTO embeds (id, message_id, title, description, color, image, thumbnail, footer) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(embedId, messageId, embed.title, embed.description, embed.color, embed.image, embed.thumbnail, embed.footer);
+      if (embed.fields?.length) {
+        const insertField = db.prepare('INSERT INTO embed_fields (id, embed_id, name, value, inline) VALUES (?, ?, ?, ?, ?)');
+        for (const field of embed.fields) {
+          insertField.run(generateId(), embedId, field.name, field.value, field.inline ? 1 : 0);
+        }
+      }
     }
 
-    const message = new Message({
-      channel: channelId,
-      author: req.user._id,
-      content: content || '',
-      type: type || 'text',
-      attachments: attachments || [],
-      embed: embed || null,
-      replyTo: replyTo || null
-    });
+    // Обновляем last_message_id
+    db.prepare('UPDATE channels SET last_message_id = ? WHERE id = ?').run(messageId, channelId);
 
-    await message.save();
-    await message.populate('author', 'username displayName avatar isBot');
-    await message.populate('replyTo');
+    const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(messageId);
+    const enriched = enrichMessage(message);
 
-    // Обновляем lastMessage канала
-    channel.lastMessage = message._id;
-    await channel.save();
-
-    // Отправляем через WebSocket
     const io = req.app.get('io');
-    io.to(`channel:${channelId}`).emit('newMessage', { message });
+    io.to(`channel:${channelId}`).emit('newMessage', { message: enriched });
 
-    // Отправляем уведомление если это ответ
+    // Уведомление об ответе
     if (replyTo) {
-      const repliedMsg = await Message.findById(replyTo).populate('author', '_id');
-      if (repliedMsg && repliedMsg.author._id.toString() !== req.user._id.toString()) {
-        io.to(`user:${repliedMsg.author._id}`).emit('notification', {
+      const replied = db.prepare('SELECT author_id FROM messages WHERE id = ?').get(replyTo);
+      if (replied && replied.author_id !== req.user.id) {
+        io.to(`user:${replied.author_id}`).emit('notification', {
           type: 'reply',
           message: `${req.user.username} ответил на ваше сообщение`,
           channelId,
-          messageId: message._id
+          messageId
         });
       }
     }
 
-    res.status(201).json({ message });
+    res.status(201).json({ message: enriched });
   } catch (error) {
-    console.error('Ошибка отправки сообщения:', error);
-    res.status(500).json({ error: 'Ошибка отправки сообщения' });
+    console.error('Ошибка отправки:', error);
+    res.status(500).json({ error: 'Ошибка отправки' });
   }
 });
 
 // Редактировать сообщение
-router.patch('/:messageId', auth, async (req, res) => {
+router.patch('/:messageId', authMiddleware, (req, res) => {
   try {
-    const message = await Message.findById(req.params.messageId);
-    
-    if (!message) {
-      return res.status(404).json({ error: 'Сообщение не найдено' });
-    }
+    const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.messageId);
+    if (!message) return res.status(404).json({ error: 'Сообщение не найдено' });
+    if (message.author_id !== req.user.id) return res.status(403).json({ error: 'Нельзя редактировать чужие сообщения' });
 
-    if (message.author.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ error: 'Нельзя редактировать чужие сообщения' });
-    }
+    const age = Date.now() - new Date(message.created_at + 'Z').getTime();
+    if (age > 3600000) return res.status(400).json({ error: 'Можно редактировать только в течение часа' });
 
-    if (Date.now() - message.createdAt > 3600000) {
-      return res.status(400).json({ error: 'Сообщение можно редактировать только в течение часа' });
-    }
+    db.prepare('UPDATE messages SET content = ?, edited = 1, edited_at = datetime(\'now\') WHERE id = ?').run(req.body.content || message.content, message.id);
 
-    message.content = req.body.content || message.content;
-    message.edited = true;
-    message.editedAt = new Date();
-    await message.save();
-    await message.populate('author', 'username displayName avatar isBot');
+    const updated = db.prepare('SELECT * FROM messages WHERE id = ?').get(message.id);
+    const enriched = enrichMessage(updated);
 
     const io = req.app.get('io');
-    io.to(`channel:${message.channel}`).emit('messageEdited', { message });
+    io.to(`channel:${message.channel_id}`).emit('messageEdited', { message: enriched });
 
-    res.json({ message });
+    res.json({ message: enriched });
   } catch (error) {
-    res.status(500).json({ error: 'Ошибка редактирования' });
+    res.status(500).json({ error: 'Ошибка' });
   }
 });
 
 // Удалить сообщение
-router.delete('/:messageId', auth, async (req, res) => {
+router.delete('/:messageId', authMiddleware, (req, res) => {
   try {
-    const message = await Message.findById(req.params.messageId);
-    
-    if (!message) {
-      return res.status(404).json({ error: 'Сообщение не найдено' });
-    }
+    const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.messageId);
+    if (!message) return res.status(404).json({ error: 'Сообщение не найдено' });
 
-    const channel = await Channel.findById(message.channel);
-    const member = channel?.members.find(
-      m => m.user.toString() === req.user._id.toString()
-    );
+    const member = db.prepare('SELECT role FROM channel_members WHERE channel_id = ? AND user_id = ?').get(message.channel_id, req.user.id);
+    const isAuthor = message.author_id === req.user.id;
+    const isMod = member && ['owner', 'admin', 'moderator'].includes(member.role);
 
-    const isAuthor = message.author.toString() === req.user._id.toString();
-    const isModerator = member && ['owner', 'admin', 'moderator'].includes(member.role);
+    if (!isAuthor && !isMod) return res.status(403).json({ error: 'Недостаточно прав' });
 
-    if (!isAuthor && !isModerator) {
-      return res.status(403).json({ error: 'Недостаточно прав' });
-    }
-
-    message.deleted = true;
-    message.content = '[Сообщение удалено]';
-    message.attachments = [];
-    await message.save();
+    db.prepare('UPDATE messages SET deleted = 1, content = \'[Сообщение удалено]\' WHERE id = ?').run(message.id);
+    db.prepare('DELETE FROM attachments WHERE message_id = ?').run(message.id);
 
     const io = req.app.get('io');
-    io.to(`channel:${message.channel}`).emit('messageDeleted', { 
-      messageId: message._id,
-      channelId: message.channel
-    });
+    io.to(`channel:${message.channel_id}`).emit('messageDeleted', { messageId: message.id, channelId: message.channel_id });
 
     res.json({ message: 'Сообщение удалено' });
   } catch (error) {
-    res.status(500).json({ error: 'Ошибка удаления' });
+    res.status(500).json({ error: 'Ошибка' });
   }
 });
 
-// Добавить реакцию
-router.post('/:messageId/react', auth, async (req, res) => {
+// Реакции
+router.post('/:messageId/react', authMiddleware, (req, res) => {
   try {
     const { emoji } = req.body;
-    const message = await Message.findById(req.params.messageId);
-    
-    if (!message) {
-      return res.status(404).json({ error: 'Сообщение не найдено' });
-    }
+    const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.messageId);
+    if (!message) return res.status(404).json({ error: 'Сообщение не найдено' });
 
-    let reaction = message.reactions.find(r => r.emoji === emoji);
-    
-    if (reaction) {
-      if (reaction.users.includes(req.user._id)) {
-        // Убрать реакцию
-        reaction.users = reaction.users.filter(
-          u => u.toString() !== req.user._id.toString()
-        );
-        if (reaction.users.length === 0) {
-          message.reactions = message.reactions.filter(r => r.emoji !== emoji);
-        }
-      } else {
-        reaction.users.push(req.user._id);
-      }
+    const existing = db.prepare('SELECT 1 FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?').get(message.id, req.user.id, emoji);
+
+    if (existing) {
+      db.prepare('DELETE FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?').run(message.id, req.user.id, emoji);
     } else {
-      message.reactions.push({ emoji, users: [req.user._id] });
+      db.prepare('INSERT INTO reactions (message_id, user_id, emoji) VALUES (?, ?, ?)').run(message.id, req.user.id, emoji);
     }
 
-    await message.save();
-
+    const reactions = getReactions(message.id);
     const io = req.app.get('io');
-    io.to(`channel:${message.channel}`).emit('messageReaction', {
-      messageId: message._id,
-      channelId: message.channel,
-      reactions: message.reactions
-    });
+    io.to(`channel:${message.channel_id}`).emit('messageReaction', { messageId: message.id, channelId: message.channel_id, reactions });
 
-    res.json({ reactions: message.reactions });
+    res.json({ reactions });
   } catch (error) {
-    res.status(500).json({ error: 'Ошибка реакции' });
+    res.status(500).json({ error: 'Ошибка' });
   }
 });
 
-// Закрепить сообщение
-router.post('/:messageId/pin', auth, async (req, res) => {
+// Закрепить
+router.post('/:messageId/pin', authMiddleware, (req, res) => {
   try {
-    const message = await Message.findById(req.params.messageId);
-    if (!message) {
-      return res.status(404).json({ error: 'Сообщение не найдено' });
-    }
+    const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(req.params.messageId);
+    if (!message) return res.status(404).json({ error: 'Сообщение не найдено' });
 
-    const channel = await Channel.findById(message.channel);
-    const member = channel?.members.find(
-      m => m.user.toString() === req.user._id.toString()
-    );
+    const member = db.prepare('SELECT role FROM channel_members WHERE channel_id = ? AND user_id = ?').get(message.channel_id, req.user.id);
+    if (!member || !['owner', 'admin', 'moderator'].includes(member.role)) return res.status(403).json({ error: 'Недостаточно прав' });
 
-    if (!member || !['owner', 'admin', 'moderator'].includes(member.role)) {
-      return res.status(403).json({ error: 'Недостаточно прав' });
-    }
-
-    message.pinned = !message.pinned;
-    await message.save();
+    const newPinned = message.pinned ? 0 : 1;
+    db.prepare('UPDATE messages SET pinned = ? WHERE id = ?').run(newPinned, message.id);
 
     const io = req.app.get('io');
-    io.to(`channel:${message.channel}`).emit('messagePinned', {
-      messageId: message._id,
-      channelId: message.channel,
-      pinned: message.pinned
-    });
+    io.to(`channel:${message.channel_id}`).emit('messagePinned', { messageId: message.id, channelId: message.channel_id, pinned: !!newPinned });
 
-    res.json({ pinned: message.pinned });
+    res.json({ pinned: !!newPinned });
   } catch (error) {
-    res.status(500).json({ error: 'Ошибка закрепления' });
+    res.status(500).json({ error: 'Ошибка' });
   }
 });
 
 // ===== BOT API =====
-
-// Отправить сообщение от бота
-router.post('/bot/:channelId', botAuth, async (req, res) => {
+router.post('/bot/:channelId', botAuthMiddleware, (req, res) => {
   try {
     const { content, embed } = req.body;
     const channelId = req.params.channelId;
 
-    const channel = await Channel.findById(channelId);
-    if (!channel) {
-      return res.status(404).json({ error: 'Канал не найден' });
+    const channel = db.prepare('SELECT * FROM channels WHERE id = ?').get(channelId);
+    if (!channel) return res.status(404).json({ error: 'Канал не найден' });
+
+    const messageId = generateId();
+    db.prepare('INSERT INTO messages (id, channel_id, author_id, content, type) VALUES (?, ?, ?, ?, ?)').run(messageId, channelId, req.bot.id, content || '', embed ? 'embed' : 'text');
+
+    if (embed) {
+      const embedId = generateId();
+      db.prepare('INSERT INTO embeds (id, message_id, title, description, color, image, thumbnail, footer) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(embedId, messageId, embed.title, embed.description, embed.color, embed.image, embed.thumbnail, embed.footer);
+      if (embed.fields?.length) {
+        const insertField = db.prepare('INSERT INTO embed_fields (id, embed_id, name, value, inline) VALUES (?, ?, ?, ?, ?)');
+        for (const field of embed.fields) {
+          insertField.run(generateId(), embedId, field.name, field.value, field.inline ? 1 : 0);
+        }
+      }
     }
 
-    const message = new Message({
-      channel: channelId,
-      author: req.bot._id,
-      content: content || '',
-      type: embed ? 'embed' : 'text',
-      embed: embed || null
-    });
+    db.prepare('UPDATE channels SET last_message_id = ? WHERE id = ?').run(messageId, channelId);
 
-    await message.save();
-    await message.populate('author', 'username displayName avatar isBot');
-
-    channel.lastMessage = message._id;
-    await channel.save();
+    const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(messageId);
+    const enriched = enrichMessage(message);
 
     const io = req.app.get('io');
-    io.to(`channel:${channelId}`).emit('newMessage', { message });
+    io.to(`channel:${channelId}`).emit('newMessage', { message: enriched });
 
-    res.status(201).json({ message });
+    res.status(201).json({ message: enriched });
   } catch (error) {
-    res.status(500).json({ error: 'Ошибка отправки сообщения ботом' });
+    console.error('Ошибка бота:', error);
+    res.status(500).json({ error: 'Ошибка' });
   }
 });
+
+// ===== ХЕЛПЕРЫ =====
+
+function enrichMessage(msg) {
+  const author = db.prepare('SELECT id, username, display_name, avatar, is_bot FROM users WHERE id = ?').get(msg.author_id);
+  const attachments = db.prepare('SELECT * FROM attachments WHERE message_id = ?').all(msg.id);
+  const embed = db.prepare('SELECT * FROM embeds WHERE message_id = ?').get(msg.id);
+  const reactions = getReactions(msg.id);
+  let replyTo = null;
+  if (msg.reply_to) {
+    replyTo = db.prepare('SELECT * FROM messages WHERE id = ?').get(msg.reply_to);
+  }
+
+  if (embed) {
+    embed.fields = db.prepare('SELECT * FROM embed_fields WHERE embed_id = ?').all(embed.id);
+  }
+
+  return { ...msg, author, attachments, embed, reactions, replyTo };
+}
+
+function getReactions(messageId) {
+  const rows = db.prepare('SELECT emoji, user_id FROM reactions WHERE message_id = ?').all(messageId);
+  const map = {};
+  for (const row of rows) {
+    if (!map[row.emoji]) map[row.emoji] = { emoji: row.emoji, users: [] };
+    map[row.emoji].users.push(row.user_id);
+  }
+  return Object.values(map);
+}
 
 module.exports = router;
