@@ -1,0 +1,28 @@
+# Render Deployment Configuration
+# Render Disk mount path: /var/data
+
+services:
+  - type: web
+    name: stasya-messenger
+    env: node
+    region: frankfurt
+    plan: starter
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/auth/me
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: MONGODB_URI
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: RENDER_DISK_PATH
+        value: /var/data
+    disk:
+      name: stasya-data
+      mountPath: /var/data
+      sizeGB: 10
+    autoDeploy: true
