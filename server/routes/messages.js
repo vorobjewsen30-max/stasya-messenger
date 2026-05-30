@@ -3,6 +3,28 @@ const router = express.Router();
 const { db, generateId } = require('../database');
 const { authMiddleware, botAuthMiddleware } = require('./auth');
 
+// Поиск сообщений
+router.get('/search', authMiddleware, (req, res) => {
+  const { q } = req.query;
+  if (!q || q.length < 2) return res.json({ messages: [] });
+
+  const messages = db.prepare(`
+    SELECT m.*, c.name as channel_name FROM messages m
+    JOIN channels c ON m.channel_id = c.id
+    JOIN channel_members cm ON c.id = cm.channel_id AND cm.user_id = ?
+    WHERE m.content LIKE ? AND m.deleted = 0
+    ORDER BY m.created_at DESC
+    LIMIT 30
+  `).all(req.user.id, `%${q}%`);
+
+  const enriched = messages.map(msg => {
+    const author = db.prepare('SELECT id, username, display_name, avatar, is_bot FROM users WHERE id = ?').get(msg.author_id);
+    return { ...msg, author };
+  });
+
+  res.json({ messages: enriched });
+});
+
 // Получить сообщения
 router.get('/:channelId', authMiddleware, (req, res) => {
   try {

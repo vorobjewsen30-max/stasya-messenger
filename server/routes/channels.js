@@ -4,6 +4,24 @@ const { db, generateId } = require('../database');
 const { authMiddleware } = require('./auth');
 const crypto = require('crypto');
 
+// Поиск каналов
+router.get('/search', authMiddleware, (req, res) => {
+  const { q } = req.query;
+  if (!q || q.length < 2) return res.json({ channels: [] });
+
+  const channels = db.prepare(`
+    SELECT DISTINCT c.* FROM channels c
+    LEFT JOIN channel_members cm ON c.id = cm.channel_id
+    WHERE (c.name LIKE ? OR c.description LIKE ?)
+      AND c.type != 'dm'
+      AND (c.is_public = 1 OR cm.user_id = ?)
+    LIMIT 20
+  `).all(`%${q}%`, `%${q}%`, req.user.id);
+
+  const result = channels.map(ch => enrichChannel(ch));
+  res.json({ channels: result });
+});
+
 // Создать канал
 router.post('/', authMiddleware, (req, res) => {
   try {
@@ -44,6 +62,27 @@ router.get('/:channelId', authMiddleware, (req, res) => {
 
   const member = db.prepare('SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?').get(channel.id, req.user.id);
   if (!member && !channel.is_public) return res.status(403).json({ error: 'Нет доступа' });
+
+  res.json({ channel: enrichChannel(channel) });
+});
+
+// Присоединиться к каналу
+router.post('/:channelId/join', authMiddleware, (req, res) => {
+  const channel = db.prepare('SELECT * FROM channels WHERE id = ?').get(req.params.channelId);
+  if (!channel) return res.status(404).json({ error: 'Канал не найден' });
+
+  const member = db.prepare('SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?').get(channel.id, req.user.id);
+  if (member) return res.status(400).json({ error: 'Вы уже участник' });
+
+  if (!channel.is_public) return res.status(403).json({ error: 'Канал приватный, нужен инвайт' });
+
+  db.prepare('INSERT INTO channel_members (channel_id, user_id, role) VALUES (?, ?, ?)').run(channel.id, req.user.id, 'member');
+
+  const io = req.app.get('io');
+  io.to(`channel:${channel.id}`).emit('memberJoined', {
+    channelId: channel.id,
+    user: { id: req.user.id, username: req.user.username, display_name: req.user.display_name, avatar: req.user.avatar }
+  });
 
   res.json({ channel: enrichChannel(channel) });
 });

@@ -9,18 +9,18 @@ router.get('/search', authMiddleware, (req, res) => {
   if (!q || q.length < 2) return res.json({ users: [] });
 
   const users = db.prepare(`
-    SELECT id, username, display_name, avatar, status, custom_status 
+    SELECT id, username, display_name, avatar, status, custom_status, bio, is_bot, verified, is_ceo
     FROM users 
-    WHERE (username LIKE ? OR display_name LIKE ?) AND id != ?
+    WHERE (username LIKE ? OR display_name LIKE ? OR bio LIKE ?) AND id != ?
     LIMIT 20
-  `).all(`%${q}%`, `%${q}%`, req.user.id);
+  `).all(`%${q}%`, `%${q}%`, `%${q}%`, req.user.id);
 
   res.json({ users });
 });
 
 // Получить пользователя
 router.get('/:username', authMiddleware, (req, res) => {
-  const user = db.prepare('SELECT id, username, display_name, avatar, status, custom_status, bio, is_bot, last_seen, created_at FROM users WHERE username = ?').get(req.params.username.toLowerCase());
+  const user = db.prepare('SELECT id, username, display_name, avatar, status, custom_status, bio, is_bot, verified, is_ceo, last_seen, created_at FROM users WHERE username = ?').get(req.params.username.toLowerCase());
   if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
   res.json({ user });
 });

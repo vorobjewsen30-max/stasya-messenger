@@ -1,10 +1,13 @@
-import React, { useState, useEffect, useContext, useRef, useCallback } from 'react';
+﻿import React, { useState, useEffect, useContext, useRef, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { AuthContext, SocketContext } from '../App';
+import CallInterface from '../components/CallInterface';
 import api from '../services/api';
 
 function Chat() {
   const { user, logout } = useContext(AuthContext);
   const socket = useContext(SocketContext);
+  const navigate = useNavigate();
 
   const [channels, setChannels] = useState([]);
   const [activeChannel, setActiveChannel] = useState(null);
@@ -19,12 +22,39 @@ function Chat() {
   const [searchResults, setSearchResults] = useState([]);
   const [incomingCall, setIncomingCall] = useState(null);
   const [activeCall, setActiveCall] = useState(null);
+  const [showSidebar, setShowSidebar] = useState(true);
+  const [isMobile, setIsMobile] = useState(window.innerWidth <= 768);
 
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
   const typingTimeoutRef = useRef(null);
 
-  // Загрузка каналов и авто-выбор первого
+  // РћРїСЂРµРґРµР»РµРЅРёРµ РјРѕР±РёР»СЊРЅРѕРіРѕ
+  useEffect(() => {
+    const handleResize = () => setIsMobile(window.innerWidth <= 768);
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  // РЎР»СѓС€Р°РµРј СЃРѕР±С‹С‚РёСЏ РІС‹Р±РѕСЂР° РєР°РЅР°Р»Р° РёР· MobileSearch
+  useEffect(() => {
+    const handleSelectChannel = (e) => {
+      const channel = e.detail;
+      if (channel) {
+        const existing = channels.find(c => (c.id || c._id) === (channel.id || channel._id));
+        if (existing) {
+          selectChannel(existing);
+        } else {
+          setChannels(prev => [...prev, channel]);
+          selectChannel(channel);
+        }
+      }
+    };
+    window.addEventListener('selectChannel', handleSelectChannel);
+    return () => window.removeEventListener('selectChannel', handleSelectChannel);
+  }, [channels]);
+
+  // Р—Р°РіСЂСѓР·РєР° РєР°РЅР°Р»РѕРІ Рё Р°РІС‚Рѕ-РІС‹Р±РѕСЂ РїРµСЂРІРѕРіРѕ
   useEffect(() => {
     loadChannels();
   }, []);
@@ -35,7 +65,7 @@ function Chat() {
     }
   }, [channels]);
 
-  // Подписка на WebSocket
+  // РџРѕРґРїРёСЃРєР° РЅР° WebSocket
   useEffect(() => {
     if (!socket) return;
 
@@ -68,7 +98,7 @@ function Chat() {
       const res = await api.get('/api/channels');
       setChannels(res.data.channels);
     } catch (err) {
-      console.error('Ошибка загрузки каналов:', err);
+      console.error('РћС€РёР±РєР° Р·Р°РіСЂСѓР·РєРё РєР°РЅР°Р»РѕРІ:', err);
     }
   };
 
@@ -76,6 +106,7 @@ function Chat() {
     setActiveChannel(channel);
     if (socket) socket.emit('joinChannel', channel._id || channel.id);
     await loadMessages(channel._id || channel.id);
+    if (isMobile) setShowSidebar(false);
   };
 
   const loadMessages = async (channelId) => {
@@ -85,7 +116,7 @@ function Chat() {
       setMessages(res.data.messages);
       scrollToBottom();
     } catch (err) {
-      console.error('Ошибка загрузки сообщений:', err);
+      console.error('РћС€РёР±РєР° Р·Р°РіСЂСѓР·РєРё СЃРѕРѕР±С‰РµРЅРёР№:', err);
     }
   };
 
@@ -110,7 +141,7 @@ function Chat() {
 
   const handleMessageDeleted = (data) => {
     if (data.channelId === (activeChannel?.id || activeChannel?._id)) {
-      setMessages(prev => prev.map(m => (m.id === data.messageId || m._id === data.messageId) ? { ...m, deleted: 1, content: '[Сообщение удалено]' } : m));
+      setMessages(prev => prev.map(m => (m.id === data.messageId || m._id === data.messageId) ? { ...m, deleted: 1, content: '[РЎРѕРѕР±С‰РµРЅРёРµ СѓРґР°Р»РµРЅРѕ]' } : m));
     }
   };
 
@@ -136,7 +167,10 @@ function Chat() {
   const handleCallAccepted = (data) => { setActiveCall(data); setIncomingCall(null); };
   const handleCallRejected = () => setIncomingCall(null);
   const handleCallEnded = () => { setActiveCall(null); setIncomingCall(null); };
-  const handleCallSignal = (data) => console.log('Call signal:', data);
+  const handleCallSignal = (data) => {
+    // РџСЂРѕР±СЂР°СЃС‹РІР°РµС‚СЃСЏ РІ CallInterface С‡РµСЂРµР· activeCall
+    console.log('Call signal received');
+  };
 
   const handleUserStatus = (data) => {
     setChannels(prev => prev.map(ch => ({
@@ -169,7 +203,7 @@ function Chat() {
     try {
       await api.post(`/api/messages/${chId}`, { content });
     } catch (err) {
-      console.error('Ошибка отправки:', err);
+      console.error('РћС€РёР±РєР° РѕС‚РїСЂР°РІРєРё:', err);
       setMessageInput(content);
     }
   };
@@ -204,7 +238,7 @@ function Chat() {
       setShowCreateModal(false);
       selectChannel(res.data.channel);
     } catch (err) {
-      console.error('Ошибка создания:', err);
+      console.error('РћС€РёР±РєР° СЃРѕР·РґР°РЅРёСЏ:', err);
     }
   };
 
@@ -216,7 +250,7 @@ function Chat() {
       setInviteCode('');
       selectChannel(res.data.channel);
     } catch (err) {
-      alert(err.response?.data?.error || 'Неверный код');
+      alert(err.response?.data?.error || 'РќРµРІРµСЂРЅС‹Р№ РєРѕРґ');
     }
   };
 
@@ -226,7 +260,7 @@ function Chat() {
     try {
       const res = await api.get(`/api/users/search?q=${query}`);
       setSearchResults(res.data.users);
-    } catch (err) { console.error('Ошибка поиска:', err); }
+    } catch (err) { console.error('РћС€РёР±РєР° РїРѕРёСЃРєР°:', err); }
   };
 
   const startDM = async (userId) => {
@@ -237,34 +271,51 @@ function Chat() {
       selectChannel(res.data.channel);
       setSearchQuery('');
       setSearchResults([]);
-    } catch (err) { console.error('Ошибка DM:', err); }
+    } catch (err) { console.error('РћС€РёР±РєР° DM:', err); }
   };
 
   const verifyUser = async (userId) => {
     try {
       await api.post(`/api/auth/verify/user/${userId}`);
-      alert('Пользователь верифицирован! ✅');
-    } catch (err) { alert(err.response?.data?.error || 'Ошибка'); }
+      alert('РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ РІРµСЂРёС„РёС†РёСЂРѕРІР°РЅ! вњ…');
+    } catch (err) { alert(err.response?.data?.error || 'РћС€РёР±РєР°'); }
   };
 
   const unverifyUser = async (userId) => {
     try {
       await api.delete(`/api/auth/verify/user/${userId}`);
-      alert('Верификация снята');
-    } catch (err) { alert(err.response?.data?.error || 'Ошибка'); }
+      alert('Р’РµСЂРёС„РёРєР°С†РёСЏ СЃРЅСЏС‚Р°');
+    } catch (err) { alert(err.response?.data?.error || 'РћС€РёР±РєР°'); }
   };
 
   const verifyChannel = async (channelId) => {
     try {
       await api.post(`/api/auth/verify/channel/${channelId}`);
-      alert('Канал верифицирован! ✅');
-    } catch (err) { alert(err.response?.data?.error || 'Ошибка'); }
+      alert('РљР°РЅР°Р» РІРµСЂРёС„РёС†РёСЂРѕРІР°РЅ! вњ…');
+    } catch (err) { alert(err.response?.data?.error || 'РћС€РёР±РєР°'); }
+  };
+
+  const startCall = (targetUserId, callType = 'voice') => {
+    if (socket) {
+      socket.emit('callUser', { targetUserId, callType });
+      // РџРѕРєР°Р·С‹РІР°РµРј РёРЅС‚РµСЂС„РµР№СЃ СЃСЂР°Р·Сѓ
+      setActiveCall({
+        from: { id: user.id, username: user.username, display_name: user.display_name },
+        targetUser: { id: targetUserId },
+        callType,
+        callId: `call_${Date.now()}`
+      });
+    }
   };
 
   const acceptCall = () => {
     if (socket && incomingCall) {
       socket.emit('callAccepted', { targetUserId: incomingCall.from.id, callType: incomingCall.callType });
-      setActiveCall({ ...incomingCall, socketId: incomingCall.socketId });
+      setActiveCall({
+        ...incomingCall,
+        targetUser: incomingCall.from,
+        callId: `call_${Date.now()}`
+      });
       setIncomingCall(null);
     }
   };
@@ -294,37 +345,55 @@ function Chat() {
   const getMsgId = (m) => m?.id || m?._id;
 
   const typingNames = Object.values(typingUsers);
-  const typingText = typingNames.length > 0 ? `${typingNames.join(', ')} печатает...` : '';
+  const typingText = typingNames.length > 0 ? `${typingNames.join(', ')} РїРµС‡Р°С‚Р°РµС‚...` : '';
 
   const activeChId = getChannelId(activeChannel);
+
+  // Р•СЃР»Рё Р°РєС‚РёРІРµРЅ Р·РІРѕРЅРѕРє вЂ” РїРѕРєР°Р·С‹РІР°РµРј CallInterface
+  if (activeCall) {
+    return <CallInterface callData={activeCall} onEnd={() => setActiveCall(null)} />;
+  }
 
   return (
     <div className="chat-layout">
       {/* Sidebar */}
-      <div className="sidebar">
+      <div className={`sidebar ${isMobile && !showSidebar ? 'hidden' : ''}`}>
         <div className="sidebar-header">
-          <h2>💬 Stasya</h2>
+          <h2>рџ’¬ Stasya</h2>
           <div className="user-status-badge" onClick={() => setShowStatusMenu(!showStatusMenu)}>
             <span className={`status-dot ${user?.status || 'offline'}`}></span>
             <span style={{ fontSize: '13px', display: 'flex', alignItems: 'center', gap: '4px' }}>
               {user?.username}
-              {user?.verified ? <span style={{ color: '#6C5CE7', fontSize: '12px' }}>✓</span> : null}
+              {user?.verified ? <span style={{ color: '#6C5CE7', fontSize: '12px' }}>вњ“</span> : null}
               {user?.is_ceo ? <span style={{ color: '#f39c12', fontSize: '10px', fontWeight: 700 }}>CEO</span> : null}
             </span>
             {showStatusMenu && (
               <div className="status-menu">
-                <div className="status-menu-item" onClick={() => changeStatus('online')}><span className="status-dot online"></span> В сети</div>
-                <div className="status-menu-item" onClick={() => changeStatus('idle')}><span className="status-dot idle"></span> Не активен</div>
-                <div className="status-menu-item" onClick={() => changeStatus('dnd')}><span className="status-dot dnd"></span> Не беспокоить</div>
-                <div className="status-menu-item" onClick={() => changeStatus('offline')}><span className="status-dot offline"></span> Невидимка</div>
-                <div className="status-menu-item" onClick={logout} style={{ borderTop: '1px solid var(--border)', color: 'var(--danger)' }}>🚪 Выйти</div>
+                <div className="status-menu-item" onClick={() => changeStatus('online')}><span className="status-dot online"></span> Р’ СЃРµС‚Рё</div>
+                <div className="status-menu-item" onClick={() => changeStatus('idle')}><span className="status-dot idle"></span> РќРµ Р°РєС‚РёРІРµРЅ</div>
+                <div className="status-menu-item" onClick={() => changeStatus('dnd')}><span className="status-dot dnd"></span> РќРµ Р±РµСЃРїРѕРєРѕРёС‚СЊ</div>
+                <div className="status-menu-item" onClick={() => changeStatus('offline')}><span className="status-dot offline"></span> РќРµРІРёРґРёРјРєР°</div>
+                <div className="status-menu-item" onClick={logout} style={{ borderTop: '1px solid var(--border)', color: 'var(--danger)' }}>рџљЄ Р’С‹Р№С‚Рё</div>
               </div>
             )}
           </div>
         </div>
 
+        {/* РљРЅРѕРїРєР° РјРѕР±РёР»СЊРЅРѕРіРѕ РїРѕРёСЃРєР° */}
+        {isMobile && (
+          <div style={{ padding: '8px 16px' }}>
+            <button
+              className="btn btn-secondary"
+              style={{ width: '100%', padding: '10px', fontSize: '14px' }}
+              onClick={() => navigate('/mobile-search')}
+            >
+              рџ”Ќ Р Р°СЃС€РёСЂРµРЅРЅС‹Р№ РїРѕРёСЃРє
+            </button>
+          </div>
+        )}
+
         <div className="search-bar">
-          <input type="text" placeholder="🔍 Поиск пользователей..." value={searchQuery} onChange={e => searchUsers(e.target.value)} />
+          <input type="text" placeholder="рџ”Ќ РџРѕРёСЃРє РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№..." value={searchQuery} onChange={e => searchUsers(e.target.value)} />
           {searchResults.length > 0 && (
             <div style={{ position: 'absolute', background: 'var(--bg-tertiary)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', marginTop: '4px', width: '248px', maxHeight: '300px', overflowY: 'auto', zIndex: 50 }}>
               {searchResults.map(u => (
@@ -338,7 +407,7 @@ function Chat() {
                   <div style={{ flex: 1 }}>
                     <div style={{ fontSize: '14px', fontWeight: 500, display: 'flex', alignItems: 'center', gap: '4px' }}>
                       {u.display_name || u.username}
-                      {u.verified ? <span style={{ color: '#6C5CE7', fontSize: '12px' }}>✓</span> : null}
+                      {u.verified ? <span style={{ color: '#6C5CE7', fontSize: '12px' }}>вњ“</span> : null}
                       {u.is_ceo ? <span style={{ color: '#f39c12', fontSize: '10px', fontWeight: 700 }}>CEO</span> : null}
                     </div>
                     <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>@{u.username}</div>
@@ -346,7 +415,7 @@ function Chat() {
                   {user?.is_ceo && !u.is_ceo && (
                     <button style={{ fontSize: '10px', padding: '2px 6px', background: u.verified ? 'var(--danger)' : 'var(--accent)', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
                       onClick={(e) => { e.stopPropagation(); u.verified ? unverifyUser(getUserId(u)) : verifyUser(getUserId(u)); }}>
-                      {u.verified ? '✕' : '✓'}
+                      {u.verified ? 'вњ•' : 'вњ“'}
                     </button>
                   )}
                 </div>
@@ -356,25 +425,25 @@ function Chat() {
         </div>
 
         <div style={{ padding: '8px 16px', display: 'flex', gap: '8px' }}>
-          <button className="btn btn-secondary" style={{ flex: 1, fontSize: '12px', padding: '8px' }} onClick={() => setShowCreateModal(true)}>+ Канал</button>
-          <button className="btn btn-secondary" style={{ flex: 1, fontSize: '12px', padding: '8px' }} onClick={() => setShowInviteModal(true)}>🔗 Войти</button>
+          <button className="btn btn-secondary" style={{ flex: 1, fontSize: '12px', padding: '8px' }} onClick={() => setShowCreateModal(true)}>+ РљР°РЅР°Р»</button>
+          <button className="btn btn-secondary" style={{ flex: 1, fontSize: '12px', padding: '8px' }} onClick={() => setShowInviteModal(true)}>рџ”— Р’РѕР№С‚Рё</button>
         </div>
 
         <div className="channel-list">
           {channels.map(channel => (
             <div key={getChannelId(channel)} className={`channel-item ${activeChId === getChannelId(channel) ? 'active' : ''}`} onClick={() => selectChannel(channel)}>
               <div className="channel-icon">
-                {channel.type === 'dm' ? '👤' : channel.type === 'voice' ? '🔊' : '💬'}
+                {channel.type === 'dm' ? 'рџ‘¤' : channel.type === 'voice' ? 'рџ”Љ' : 'рџ’¬'}
               </div>
               <div className="channel-info">
                 <div className="channel-name" style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                   {channel.type === 'dm'
                     ? channel.members?.find(m => getUserId(m.user || m) !== getUserId(user))?.user?.display_name || channel.members?.find(m => getUserId(m.user || m) !== getUserId(user))?.display_name || 'DM'
                     : `# ${channel.name}`}
-                  {channel.verified ? <span style={{ color: '#6C5CE7', fontSize: '12px' }}>✓</span> : null}
+                  {channel.verified ? <span style={{ color: '#6C5CE7', fontSize: '12px' }}>вњ“</span> : null}
                 </div>
                 <div className="channel-preview">
-                  {channel.lastMessage?.content?.substring(0, 40) || 'Нет сообщений'}
+                  {channel.lastMessage?.content?.substring(0, 40) || 'РќРµС‚ СЃРѕРѕР±С‰РµРЅРёР№'}
                 </div>
               </div>
             </div>
@@ -387,36 +456,52 @@ function Chat() {
         {activeChannel ? (
           <>
             <div className="chat-header">
-              <div className="chat-header-info">
-                <h3 style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  {activeChannel.type === 'dm'
-                    ? activeChannel.members?.find(m => getUserId(m.user || m) !== getUserId(user))?.user?.display_name || activeChannel.members?.find(m => getUserId(m.user || m) !== getUserId(user))?.display_name || 'DM'
-                    : `# ${activeChannel.name}`}
-                  {activeChannel.verified ? <span style={{ color: '#6C5CE7', fontSize: '14px' }} title="Верифицирован">✓</span> : null}
-                  {user?.is_ceo && activeChannel.type !== 'dm' && (
-                    <button style={{ fontSize: '10px', padding: '2px 6px', background: activeChannel.verified ? 'var(--danger)' : 'var(--accent)', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
-                      onClick={() => activeChannel.verified ? 
-                        api.delete(`/api/auth/verify/channel/${activeChId}`).then(() => setActiveChannel(prev => ({ ...prev, verified: 0 }))) :
-                        api.post(`/api/auth/verify/channel/${activeChId}`).then(() => setActiveChannel(prev => ({ ...prev, verified: 1 })))
-                      }>
-                      {activeChannel.verified ? 'Снять ✓' : '✓ Вериф.'}
-                    </button>
-                  )}
-                </h3>
-                <p>
-                  {activeChannel.type === 'dm'
-                    ? `@${activeChannel.members?.find(m => getUserId(m.user || m) !== getUserId(user))?.user?.username || activeChannel.members?.find(m => getUserId(m.user || m) !== getUserId(user))?.username || ''}`
-                    : `${activeChannel.members?.length || 0} участников`}
-                </p>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                {isMobile && (
+                  <button className="icon-btn" onClick={() => setShowSidebar(true)} title="РљР°РЅР°Р»С‹">
+                    в°
+                  </button>
+                )}
+                <div className="chat-header-info">
+                  <h3 style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    {activeChannel.type === 'dm'
+                      ? activeChannel.members?.find(m => getUserId(m.user || m) !== getUserId(user))?.user?.display_name || activeChannel.members?.find(m => getUserId(m.user || m) !== getUserId(user))?.display_name || 'DM'
+                      : `# ${activeChannel.name}`}
+                    {activeChannel.verified ? <span style={{ color: '#6C5CE7', fontSize: '14px' }} title="Р’РµСЂРёС„РёС†РёСЂРѕРІР°РЅ">вњ“</span> : null}
+                    {user?.is_ceo && activeChannel.type !== 'dm' && (
+                      <button style={{ fontSize: '10px', padding: '2px 6px', background: activeChannel.verified ? 'var(--danger)' : 'var(--accent)', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
+                        onClick={() => activeChannel.verified ? 
+                          api.delete(`/api/auth/verify/channel/${activeChId}`).then(() => setActiveChannel(prev => ({ ...prev, verified: 0 }))) :
+                          api.post(`/api/auth/verify/channel/${activeChId}`).then(() => setActiveChannel(prev => ({ ...prev, verified: 1 })))
+                        }>
+                        {activeChannel.verified ? 'РЎРЅСЏС‚СЊ вњ“' : 'вњ“ Р’РµСЂРёС„.'}
+                      </button>
+                    )}
+                  </h3>
+                  <p>
+                    {activeChannel.type === 'dm'
+                      ? `@${activeChannel.members?.find(m => getUserId(m.user || m) !== getUserId(user))?.user?.username || activeChannel.members?.find(m => getUserId(m.user || m) !== getUserId(user))?.username || ''}`
+                      : `${activeChannel.members?.length || 0} СѓС‡Р°СЃС‚РЅРёРєРѕРІ`}
+                  </p>
+                </div>
               </div>
               <div className="chat-header-actions">
                 {activeChannel.type === 'dm' && (
                   <>
-                    <button className="icon-btn" title="Звонок" onClick={() => {
+                    <button className="icon-btn" title="Р“РѕР»РѕСЃРѕРІРѕР№ Р·РІРѕРЅРѕРє" onClick={() => {
                       const targetId = getUserId(activeChannel.members?.find(m => getUserId(m.user || m) !== getUserId(user))?.user || activeChannel.members?.find(m => getUserId(m.user || m) !== getUserId(user)));
-                      if (targetId) socket?.emit('callUser', { targetUserId: targetId, callType: 'voice' });
-                    }}>📞</button>
+                      if (targetId) startCall(targetId, 'voice');
+                    }}>рџ“ћ</button>
+                    <button className="icon-btn" title="Р’РёРґРµРѕР·РІРѕРЅРѕРє" onClick={() => {
+                      const targetId = getUserId(activeChannel.members?.find(m => getUserId(m.user || m) !== getUserId(user))?.user || activeChannel.members?.find(m => getUserId(m.user || m) !== getUserId(user)));
+                      if (targetId) startCall(targetId, 'video');
+                    }}>рџ“№</button>
                   </>
+                )}
+                {isMobile && (
+                  <button className="icon-btn" onClick={() => navigate('/mobile-search')} title="РџРѕРёСЃРє">
+                    рџ”Ќ
+                  </button>
                 )}
               </div>
             </div>
@@ -433,18 +518,17 @@ function Chat() {
                   <div className="message-content">
                     <div className="message-header">
                       <span className={`message-author ${author.is_bot ? 'bot' : ''}`} style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                        {author.display_name || author.username || 'Неизвестный'}
-                        {author.verified ? <span style={{ color: '#6C5CE7', fontSize: '12px' }} title="Верифицирован">✓</span> : null}
+                        {author.display_name || author.username || 'РќРµРёР·РІРµСЃС‚РЅС‹Р№'}
+                        {author.verified ? <span style={{ color: '#6C5CE7', fontSize: '12px' }} title="Р’РµСЂРёС„РёС†РёСЂРѕРІР°РЅ">вњ“</span> : null}
                         {author.is_ceo ? <span style={{ color: '#f39c12', fontSize: '10px', fontWeight: 700, background: 'rgba(243,156,18,0.15)', padding: '1px 4px', borderRadius: '3px' }}>CEO</span> : null}
                       </span>
                       {author.is_bot ? <span className="bot-badge">BOT</span> : null}
                       <span className="message-time">{formatTime(msg.created_at || msg.createdAt)}</span>
-                      {msg.edited ? <span className="message-edited">(изменено)</span> : null}
-                      {/* CEO может верифицировать пользователя через сообщение */}
+                      {msg.edited ? <span className="message-edited">(РёР·РјРµРЅРµРЅРѕ)</span> : null}
                       {user?.is_ceo && !author.is_ceo && !author.is_bot && (
                         <button style={{ fontSize: '9px', padding: '1px 4px', background: author.verified ? 'var(--danger)' : 'var(--accent)', color: 'white', border: 'none', borderRadius: '3px', cursor: 'pointer', marginLeft: '4px' }}
                           onClick={() => author.verified ? unverifyUser(authorId) : verifyUser(authorId)}>
-                          {author.verified ? '✕' : '✓'}
+                          {author.verified ? 'вњ•' : 'вњ“'}
                         </button>
                       )}
                     </div>
@@ -477,17 +561,22 @@ function Chat() {
                 <textarea ref={inputRef} value={messageInput}
                   onChange={e => { setMessageInput(e.target.value); handleTyping(); }}
                   onKeyDown={handleKeyDown}
-                  placeholder={`Написать в ${activeChannel.type === 'dm' ? 'личные сообщения' : '#' + activeChannel.name}...`}
+                  placeholder={`РќР°РїРёСЃР°С‚СЊ РІ ${activeChannel.type === 'dm' ? 'Р»РёС‡РЅС‹Рµ СЃРѕРѕР±С‰РµРЅРёСЏ' : '#' + activeChannel.name}...`}
                   rows={1} />
-                <button className="send-btn" onClick={sendMessage} disabled={!messageInput.trim()}>➤</button>
+                <button className="send-btn" onClick={sendMessage} disabled={!messageInput.trim()}>вћ¤</button>
               </div>
             </div>
           </>
         ) : (
           <div className="welcome-screen">
-            <div className="icon">💬</div>
+            <div className="icon">рџ’¬</div>
             <h2>Stasya Messenger</h2>
-            <p>Выберите канал или начните диалог. Используйте поиск чтобы найти пользователей.</p>
+            <p>Р’С‹Р±РµСЂРёС‚Рµ РєР°РЅР°Р» РёР»Рё РЅР°С‡РЅРёС‚Рµ РґРёР°Р»РѕРі. РСЃРїРѕР»СЊР·СѓР№С‚Рµ РїРѕРёСЃРє С‡С‚РѕР±С‹ РЅР°Р№С‚Рё РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№.</p>
+            {isMobile && (
+              <button className="btn btn-primary" style={{ maxWidth: '250px' }} onClick={() => navigate('/mobile-search')}>
+                рџ”Ќ РџРѕРёСЃРє РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№ Рё РєР°РЅР°Р»РѕРІ
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -495,20 +584,12 @@ function Chat() {
       {/* Incoming Call */}
       {incomingCall && (
         <div className="call-notification">
-          <h4>📞 Входящий {incomingCall.callType === 'video' ? 'видео' : 'голосовой'} звонок</h4>
-          <p>От: {incomingCall.from.display_name || incomingCall.from.username}</p>
+          <h4>рџ“ћ Р’С…РѕРґСЏС‰РёР№ {incomingCall.callType === 'video' ? 'РІРёРґРµРѕ' : 'РіРѕР»РѕСЃРѕРІРѕР№'} Р·РІРѕРЅРѕРє</h4>
+          <p>РћС‚: {incomingCall.from.display_name || incomingCall.from.username}</p>
           <div className="call-notification-actions">
-            <button className="btn btn-primary" style={{ flex: 1 }} onClick={acceptCall}>Принять</button>
-            <button className="btn btn-danger" style={{ flex: 1 }} onClick={rejectCall}>Отклонить</button>
+            <button className="btn btn-primary" style={{ flex: 1 }} onClick={acceptCall}>РџСЂРёРЅСЏС‚СЊ</button>
+            <button className="btn btn-danger" style={{ flex: 1 }} onClick={rejectCall}>РћС‚РєР»РѕРЅРёС‚СЊ</button>
           </div>
-        </div>
-      )}
-
-      {activeCall && (
-        <div className="call-notification" style={{ borderColor: 'var(--success)' }}>
-          <h4>🔊 Звонок активен</h4>
-          <button className="btn btn-danger" style={{ marginTop: '8px' }}
-            onClick={() => { socket?.emit('callEnded', { targetUserId: activeCall.from?.id }); setActiveCall(null); }}>Завершить</button>
         </div>
       )}
 
@@ -516,20 +597,20 @@ function Chat() {
       {showCreateModal && (
         <div className="modal-overlay" onClick={() => setShowCreateModal(false)}>
           <div className="modal" onClick={e => e.stopPropagation()}>
-            <h3>Создать канал</h3>
+            <h3>РЎРѕР·РґР°С‚СЊ РєР°РЅР°Р»</h3>
             <form onSubmit={createChannel}>
-              <div className="form-group"><label>Название</label><input name="name" placeholder="Название канала" required autoFocus /></div>
-              <div className="form-group"><label>Тип</label>
+              <div className="form-group"><label>РќР°Р·РІР°РЅРёРµ</label><input name="name" placeholder="РќР°Р·РІР°РЅРёРµ РєР°РЅР°Р»Р°" required autoFocus /></div>
+              <div className="form-group"><label>РўРёРї</label>
                 <select name="type" style={{ width: '100%', padding: '12px', background: 'var(--bg-primary)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', color: 'var(--text-primary)', fontSize: '15px' }}>
-                  <option value="text">💬 Текстовый</option>
-                  <option value="voice">🔊 Голосовой</option>
-                  <option value="group">👥 Группа</option>
+                  <option value="text">рџ’¬ РўРµРєСЃС‚РѕРІС‹Р№</option>
+                  <option value="voice">рџ”Љ Р“РѕР»РѕСЃРѕРІРѕР№</option>
+                  <option value="group">рџ‘Ґ Р“СЂСѓРїРїР°</option>
                 </select>
               </div>
-              <div className="form-group"><label>Описание</label><input name="description" placeholder="Описание канала" /></div>
+              <div className="form-group"><label>РћРїРёСЃР°РЅРёРµ</label><input name="description" placeholder="РћРїРёСЃР°РЅРёРµ РєР°РЅР°Р»Р°" /></div>
               <div className="modal-actions">
-                <button type="button" className="btn btn-secondary" onClick={() => setShowCreateModal(false)}>Отмена</button>
-                <button type="submit" className="btn btn-primary">Создать</button>
+                <button type="button" className="btn btn-secondary" onClick={() => setShowCreateModal(false)}>РћС‚РјРµРЅР°</button>
+                <button type="submit" className="btn btn-primary">РЎРѕР·РґР°С‚СЊ</button>
               </div>
             </form>
           </div>
@@ -540,11 +621,11 @@ function Chat() {
       {showInviteModal && (
         <div className="modal-overlay" onClick={() => setShowInviteModal(false)}>
           <div className="modal" onClick={e => e.stopPropagation()}>
-            <h3>Присоединиться по коду</h3>
-            <div className="form-group"><label>Код приглашения</label><input value={inviteCode} onChange={e => setInviteCode(e.target.value)} placeholder="Введите код..." autoFocus /></div>
+            <h3>РџСЂРёСЃРѕРµРґРёРЅРёС‚СЊСЃСЏ РїРѕ РєРѕРґСѓ</h3>
+            <div className="form-group"><label>РљРѕРґ РїСЂРёРіР»Р°С€РµРЅРёСЏ</label><input value={inviteCode} onChange={e => setInviteCode(e.target.value)} placeholder="Р’РІРµРґРёС‚Рµ РєРѕРґ..." autoFocus /></div>
             <div className="modal-actions">
-              <button className="btn btn-secondary" onClick={() => setShowInviteModal(false)}>Отмена</button>
-              <button className="btn btn-primary" onClick={joinByInvite}>Присоединиться</button>
+              <button className="btn btn-secondary" onClick={() => setShowInviteModal(false)}>РћС‚РјРµРЅР°</button>
+              <button className="btn btn-primary" onClick={joinByInvite}>РџСЂРёСЃРѕРµРґРёРЅРёС‚СЊСЃСЏ</button>
             </div>
           </div>
         </div>
@@ -554,3 +635,4 @@ function Chat() {
 }
 
 export default Chat;
+
